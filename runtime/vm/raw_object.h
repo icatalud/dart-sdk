@@ -160,26 +160,19 @@ class RawObject {
     }
 
     static intptr_t decode(uword tag) {
-// Comment: I do not think considering the hashCode size should go here, but TagSize
-// is used instead of HeapSize or HeapSizeFromClass in a few places to traverse
-// pointers or to iterate over heap objects.
-// I suggest standarizing the method for retrieving the HeapSize, ideally using one
-// cannonical method everywhere (HeapSize()). Also to determine size of RawObject,
-// a method RawObject::RawSize should be used instead of sizeof(RawObject), which
-// allows considering the extra size, which should have no impact when hash n object
-// header is set, because the compiler probably optimizes RawSize() call to
-// sizeof(RawObject) in those cases.
-#if defined(HASH_IN_OBJECT_HEADER)
       return TagValueToSize(SizeBits::decode(tag));
-#else
-      return TagValueToSize(SizeBits::decode(tag)) +
-             (static_cast<uint8_t>(TrailingHashCodeBit::decode(tag))
-              << kWordSizeLog2);
-#endif
     }
 
     static uword update(intptr_t size, uword tag) {
       return SizeBits::update(SizeToTagValue(size), tag);
+    }
+
+    static uword increaseSize(intptr_t extraSize, uword tag) {
+      intptr_t oldSize = decode(tag);
+      if (oldSize >= kMaxSizeTag) {
+        return tag;
+      }
+      return update(oldSize + extraSize, tag);
     }
 
    private:
@@ -232,15 +225,9 @@ class RawObject {
                  reinterpret_cast<uword>(this);
     }
     if (!HashCodeWasRetrieved()) {
-      ptr()->tags_ = HashCodeRetrievedBit::update(true, ptr()->tags_);
+      ptr()->tags_.fetch_or(HashCodeRetrievedBit::encode(true));
     }
-    return reinterpret_cast<uint32_t>(this)
-  }
-
-  void SetTrailingHashCode(uint32_t hashCode) const {
-    ASSERT(HasTrailingHashCode() && HashCodeWasRetrieved());
-    *reinterpret_cast<void*>(static_cast<uword>(ptr()) + HeapSize() -) =
-        reinterpret_cast<uint32_t>(this);
+    return reinterpret_cast<uint32_t>(this);
   }
 
   bool HasTrailingHashCode() const {
@@ -251,24 +238,40 @@ class RawObject {
     return HashCodeRetrievedBit::decode(ptr()->tags_);
   }
 
-  // Extra size required for storing the hashCode in 32 bit
+  // Extra size (in bytes) used for storing the hashCode.
   uint8_t TrailingExtraSize() const {
-    return static_cast<uint8_t>(HasTrailingHashCode()) << kWordSizeLog2;
+    return static_cast<uint8_t>(HasTrailingHashCode()) << kObjectAlignmentLog2;
   }
 
+  // Extra size (in bytes) required for storing the hashCode if the object is
+  // reallocated to another address.
   uint8_t ReallocationExtraSize() const {
     ASSERT(IsHeapObject());
-    return (static_cast<uint8_t>(HashCodeWasRetrieved()) -
-            static_cast<uint8_t>(HasTrailingHashCode()))
-           << kWordSizeLog2;
-    // ASSERT(extra_size==0 || ::decode(ptr()->tags_);
+    return (1 & (static_cast<uint8_t>(HashCodeWasRetrieved()) -
+                 static_cast<uint8_t>(HasTrailingHashCode())))
+           << kObjectAlignmentLog2;
+  }
+
+  void UpdateReallocationTags() {
+    uint32_t newTags = SizeTag::increaseSize(trailingExtraSize, ptr()->tags_);
+    if (tags == ptr()->tags_) {
+      // If tags wasn't changed the size was already at kMaxSizeTag. This case
+      // needs still to be handled. The HashCodeRetrievedBit is left set, to
+      // differentiate from the other case.
+      newTags = TrailingHashCodeBit::update(true, tags);
+      raw_new->ptr()->tags_ = tags;
+    } else {
+      newTags = HashCodeRetrievedBit::update(false, tags);
+      newTags = TrailingHashCodeBit::update(true, tags);
+      raw_new->ptr()->tags_ = tags;
+    }
   }
 #endif
 
-  intptr_t ReallocateHeapSize() {
+  uint8_t ReallocationHeapSize() const {
 #if defined(HASH_IN_OBJECT_HEADER)
     return HeapSize();
-#else  // 32 bit platform
+#else
     return HeapSize() + ReallocationExtraSize();
 #endif
   }
@@ -280,10 +283,12 @@ class RawObject {
 #if !defined(HASH_IN_OBJECT_HEADER)  // 32 bit platform
     uint8_t trailingExtraSize = ReallocationExtraSize();
     if (trailingExtraSize > 0) {
+      // Stores the hashCode in the last spot of the object. It is assumed that
+      // this extra space was taken into account before invoking Reallocate.
       *reinterpret_cast<void*>(new_addr + size) =
-          reinterpret_cast<uint32_t>(this);
+          Smi::New(reinterpret_cast<uint32_t>(this));
       RawObject* raw_new = reinterpret_cast<RawObject*>(new_addr);
-      raw_new->tags_ = TrailingHashCodeBit::update(true, raw_new->tags_);
+      raw_new->UpdateReallocationTags();
     }
 #endif
   }
@@ -494,23 +499,16 @@ class RawObject {
     }
 
     // Calculate the first and last raw object pointer fields.
-    // intptr_t instance_size = HeapSize();
-    // uword obj_addr = ToAddr(this);
-    // uword from = obj_addr + sizeof(RawObject);
-    // uword to = obj_addr + instance_size - kWordSize;
-    uword from = FirstPointerAddr(this);
-    uword to = LastPointerAddr(this);
+    intptr_t instance_size = HeapSize();
+    uword obj_addr = ToAddr(this);
+    uword from = obj_addr + sizeof(RawObject);
+    uword to = obj_addr + instance_size - kWordSize;
 
     // Call visitor function virtually
     visitor->VisitPointers(reinterpret_cast<RawObject**>(from),
                            reinterpret_cast<RawObject**>(to));
-    // visitor->VisitPointers(
-    //     reinterpret_cast<RawObject**>(FirstPointerAddr(this)),
-    //     reinterpret_cast<RawObject**>(LastPointerAddr(this));
 
-    // This should return HeapSize(). Calculating the size from the addressed
-    // is more efficientthan recomputing HeapSize().
-    return to - ToAddr(this) + kWordSize;
+    return instance_size;
   }
 
   template <class V>
@@ -522,14 +520,13 @@ class RawObject {
     }
 
     // Calculate the first and last raw object pointer fields.
-    // intptr_t instance_size = HeapSize();
-    // uword obj_addr = ToAddr(this);
-    // uword to = obj_addr + instance_size - kWordSize;
+    intptr_t instance_size = HeapSize();
+    uword from = obj_addr + sizeof(RawObject);
+    uword to = obj_addr + instance_size - kWordSize;
 
     // Call visitor function non-virtually
-    visitor->V::VisitPointers(
-        reinterpret_cast<RawObject**>(FirstPointerAddr(this)),
-        reinterpret_cast<RawObject**>(LastPointerAddr(this)));
+    visitor->V::VisitPointers(reinterpret_cast<RawObject**>(from),
+                              reinterpret_cast<RawObject**>(to));
 
     return instance_size;
   }
@@ -553,15 +550,8 @@ class RawObject {
   }
 
   static uword LastPointerAddr(const RawObject* raw_obj) {
-#if defined(HASH_IN_OBJECT_HEADER)
     return reinterpret_cast<uword>(raw_obj->ptr()) + raw_obj->HeapSize() -
            kWordSize;
-// In 32bit arch, raw objects can have an extra trailing size where the
-// hashCode is stored.
-#else
-    return reinterpret_cast<uword>(raw_obj->ptr()) + raw_obj->HeapSize() -
-           raw_obj->TrailingExtraSize() - kWordSize;
-#endif
   }
 
   static bool IsCanonical(intptr_t value) {
@@ -608,7 +598,7 @@ class RawObject {
 
   // TODO(koda): After handling tags_, return const*, like Object::raw_ptr().
   // why is this necessary? How come the returned RawObject can access fields
-  // and 'this' cannot, when both are RawObject
+  // and 'this' cannot when both are RawObject
   RawObject* ptr() const {
     ASSERT(IsHeapObject());
     return reinterpret_cast<RawObject*>(reinterpret_cast<uword>(this) -
