@@ -211,17 +211,12 @@ class RawObject {
   //     : public BitField<uint32_t, intptr_t, kReservedTagPos, kReservedTagSize> {
   // };
 
-#if !defined(HASH_IN_OBJECT_HEADER)  // 32 bit platform
-
-  class HashCodeRetrievedBit
-      : public BitField<uint32_t, bool, kHashCodeRetrievedBit, 1> {};
-
-  class TrailingHashCodeBit
-      : public BitField<uint32_t, bool, kTrailingHashCodeBit, 1> {};
-
-  uint32_t GetHashCode() const {
+#if defined(HASH_IN_OBJECT_HEADER)
+  uint32_t GetHash() const { return ptr()->hash_; }
+#else
+  uint32_t GetHash() {
     if (HasTrailingHashCode()) {
-      return reinterpret_cast<void*>(LastPointerAddr(this) + kWordSize) =
+      return reinterpret_cast<void*>(HeapSize() - kWordSize) =
                  reinterpret_cast<uword>(this);
     }
     if (!HashCodeWasRetrieved()) {
@@ -229,6 +224,15 @@ class RawObject {
     }
     return reinterpret_cast<uint32_t>(this);
   }
+#endif
+
+#if !defined(HASH_IN_OBJECT_HEADER)  // 32 bit platform
+
+  class HashCodeRetrievedBit
+      : public BitField<uint32_t, bool, kHashCodeRetrievedBit, 1> {};
+
+  class TrailingHashCodeBit
+      : public BitField<uint32_t, bool, kTrailingHashCodeBit, 1> {};
 
   bool HasTrailingHashCode() const {
     return TrailingHashCodeBit::decode(ptr()->tags_);
@@ -247,9 +251,9 @@ class RawObject {
   // reallocated to another address.
   uint8_t ReallocationExtraSize() const {
     ASSERT(IsHeapObject());
-    return (1 & (static_cast<uint8_t>(HashCodeWasRetrieved()) -
+    return (2 & (1 + static_cast<uint8_t>(HashCodeWasRetrieved()) -
                  static_cast<uint8_t>(HasTrailingHashCode())))
-           << kObjectAlignmentLog2;
+           >> 1 << kObjectAlignmentLog2;
   }
 
   void UpdateReallocationTags() {
@@ -450,10 +454,6 @@ class RawObject {
     return IsHeapObject() ? GetClassId() : static_cast<intptr_t>(kSmiCid);
   }
 
-  intptr_t GetClassIdMayBeSmi() const {
-    return IsHeapObject() ? GetClassId() : static_cast<intptr_t>(kSmiCid);
-  }
-
   intptr_t HeapSize() const {
     ASSERT(IsHeapObject());
     uint32_t tags = ptr()->tags_;
@@ -521,6 +521,7 @@ class RawObject {
 
     // Calculate the first and last raw object pointer fields.
     intptr_t instance_size = HeapSize();
+    uword obj_addr = ToAddr(this);
     uword from = obj_addr + sizeof(RawObject);
     uword to = obj_addr + instance_size - kWordSize;
 
