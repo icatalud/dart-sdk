@@ -169,7 +169,7 @@ class RawObject {
 
     static uword increaseSize(intptr_t extraSize, uword tag) {
       intptr_t oldSize = decode(tag);
-      if (oldSize >= kMaxSizeTag) {
+      if (oldSize == 0) {
         return tag;
       }
       return update(oldSize + extraSize, tag);
@@ -212,21 +212,39 @@ class RawObject {
   // };
 
 #if defined(HASH_IN_OBJECT_HEADER)
-  uint32_t GetHash() const { return ptr()->hash_; }
-#else
-  uint32_t GetHash() {
-    if (HasTrailingHashCode()) {
-      return reinterpret_cast<void*>(HeapSize() - kWordSize) =
-                 reinterpret_cast<uword>(this);
+  // uint32_t GetHash() const { return ptr()->hash_; }  // TODO: testing below
+  uint32_t GetHash() const {
+    uintptr_t value = (reinterpret_cast<uintptr_t>(this) << 1) >> 1;
+    if (value > 0 && ptr()->hash_ == 0) {
+      // ptr()->hash_ = value;
+      // OS::Print("Accessed hashcode: 0x%X, hash_ = 0x%X\n", value, ptr()->hash_);
     }
-    if (!HashCodeWasRetrieved()) {
+    if (!HashCodeWasRetrieved()) {  // TODO: testing
       ptr()->tags_.fetch_or(HashCodeRetrievedBit::encode(true));
     }
-    return reinterpret_cast<uint32_t>(this);
+    return ptr()->hash_;
+    // return rand();  //ptr()->hash_;
+  }
+#else
+  uint32_t GetHash() {
+    intptr_t value;
+    if (HasTrailingHashCode()) {
+      value = static_cast<intptr_t>(LastPointerAddr(this));
+    } else {
+      value = reinterpret_cast<intptr_t>(this);
+    }
+    // Shift to convert to *RawSmi (loses most significant bit)
+    value <<= 1;
+    if (!HashCodeWasRetrieved()) {  // TODO: testing
+      ptr()->tags_.fetch_or(HashCodeRetrievedBit::encode(true));
+    }
+    // return static_cast<uint32_t>(static_cast<intptr_t>(this));
+    // value = reinterpret_cast<intptr_t>(this) << 1;
+    return static_cast<uint32_t>(value >> 1);
   }
 #endif
 
-#if !defined(HASH_IN_OBJECT_HEADER)  // 32 bit platform
+#if defined(FAST_HASH_FOR_32_BIT)  // 32 bit platform
 
   class HashCodeRetrievedBit
       : public BitField<uint32_t, bool, kHashCodeRetrievedBit, 1> {};
@@ -251,48 +269,73 @@ class RawObject {
   // reallocated to another address.
   uint8_t ReallocationExtraSize() const {
     ASSERT(IsHeapObject());
-    return (2 & (1 + static_cast<uint8_t>(HashCodeWasRetrieved()) -
-                 static_cast<uint8_t>(HasTrailingHashCode())))
-           >> 1 << kObjectAlignmentLog2;
+    // return ((2 & (1 + static_cast<uint8_t>(HashCodeWasRetrieved()) -
+    //               static_cast<uint8_t>(HasTrailingHashCode()))) >>
+    //         1)
+    //        << kObjectAlignmentLog2;
+    if (HashCodeWasRetrieved() && !HasTrailingHashCode()) {
+      return 0;  // TODO: testing extra size 0
+      // return kObjectAlignment;
+    }
+    if (!HasTrailingHashCode()) {  // TODO: testing always add trailing hashCode
+      // return kObjectAlignment;
+    }
+    return 0;
   }
 
-  void UpdateReallocationTags() {
-    uint32_t newTags = SizeTag::increaseSize(trailingExtraSize, ptr()->tags_);
-    if (tags == ptr()->tags_) {
+  uint32_t ReallocationTags() {
+    intptr_t size = SizeTag::decode(ptr()->tags_);
+    uint32_t newTags =
+        SizeTag::increaseSize(ReallocationExtraSize(), ptr()->tags_);
+    if (newTags == ptr()->tags_) {
       // If tags wasn't changed the size was already at kMaxSizeTag. This case
       // needs still to be handled. The HashCodeRetrievedBit is left set, to
       // differentiate from the other case.
-      newTags = TrailingHashCodeBit::update(true, tags);
-      raw_new->ptr()->tags_ = tags;
+      newTags = TrailingHashCodeBit::update(true, newTags);
+      OS::Print("Could't increase size in tag after reallocation. %d==0? \n",
+                size);
     } else {
-      newTags = HashCodeRetrievedBit::update(false, tags);
-      newTags = TrailingHashCodeBit::update(true, tags);
-      raw_new->ptr()->tags_ = tags;
+      newTags = HashCodeRetrievedBit::update(false, newTags);
+      newTags = TrailingHashCodeBit::update(true, newTags);
     }
+    return newTags;
   }
 #endif
 
-  uint8_t ReallocationHeapSize() const {
-#if defined(HASH_IN_OBJECT_HEADER)
+  intptr_t ReallocationHeapSize() const {
+#if !defined(FAST_HASH_FOR_32_BIT)
     return HeapSize();
 #else
     return HeapSize() + ReallocationExtraSize();
 #endif
   }
 
+  static RawSmi* NewSmi(intptr_t value) {
+    RawSmi* raw_smi = reinterpret_cast<RawSmi*>(
+        (static_cast<uintptr_t>(value) << kSmiTagShift) | kSmiTag);
+    ASSERT(ValueFromRawSmi(raw_smi) == value);
+    return raw_smi;
+  }
+
   void Reallocate(uword new_addr, size_t size) {
     ASSERT(IsHeapObject());
+    ASSERT(size == HeapSize());
     memmove(reinterpret_cast<void*>(new_addr), reinterpret_cast<void*>(ptr()),
             size);
-#if !defined(HASH_IN_OBJECT_HEADER)  // 32 bit platform
+    // OS::Print("Moved object with hashcode: 0x%X\n", GetHash());
+#if defined(FAST_HASH_FOR_32_BIT)  // 32 bit platform
     uint8_t trailingExtraSize = ReallocationExtraSize();
     if (trailingExtraSize > 0) {
+      // OS::Print("Moved object %s storing trailing hashcode: 0x%X\n",  ,GetHash());
       // Stores the hashCode in the last spot of the object. It is assumed that
       // this extra space was taken into account before invoking Reallocate.
-      *reinterpret_cast<void*>(new_addr + size) =
-          Smi::New(reinterpret_cast<uint32_t>(this));
-      RawObject* raw_new = reinterpret_cast<RawObject*>(new_addr);
-      raw_new->UpdateReallocationTags();
+      /*StoreSmi(reinterpret_cast<rawsmi*>(new_addr + size),
+               NewSmi(reinterpret_cast<uintptr_t>(this)));*/
+      memset(reinterpret_cast<void*>(new_addr + size), NULL, kWordSize);
+      *reinterpret_cast<RawSmi**>(new_addr + trailingExtraSize - kWordSize) =
+          NewSmi(GetHash());
+      // RawObject* raw_new = reinterpret_cast<RawObject*>(new_addr);
+      RawObject::FromAddr(new_addr)->ptr()->tags_ = ReallocationTags();
     }
 #endif
   }
@@ -548,6 +591,10 @@ class RawObject {
 
   static uword FirstPointerAddr(const RawObject* raw_obj) {
     return reinterpret_cast<uword>(raw_obj->ptr()) + sizeof(RawObject);
+  }
+
+  static RawObject* LastPointer(const RawObject* raw_obj) {
+    return reinterpret_cast<RawObject*>(LastPointerAddr(raw_obj));
   }
 
   static uword LastPointerAddr(const RawObject* raw_obj) {
