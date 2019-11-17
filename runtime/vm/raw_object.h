@@ -215,8 +215,8 @@ class RawObject {
   // uint32_t GetHash() const { return ptr()->hash_; }  // TODO: testing below
   uint32_t GetHash() const {
     uintptr_t value = (reinterpret_cast<uintptr_t>(this) << 1) >> 1;
-    if (value > 0 && ptr()->hash_ == 0) {
-      // ptr()->hash_ = value;
+    if (ptr()->hash_ == 0) {
+      //ptr()->hash_ = value;
       // OS::Print("Accessed hashcode: 0x%X, hash_ = 0x%X\n", value, ptr()->hash_);
     }
     if (!HashCodeWasRetrieved()) {  // TODO: testing
@@ -290,16 +290,16 @@ class RawObject {
     return 0;
   }
 
-  uint32_t ReallocationTags() {
+  uint32_t ReallocationTagsWithTrailingExtraSize() {
     intptr_t size = SizeTag::decode(ptr()->tags_);
     uint32_t newTags =
-        SizeTag::increaseSize(ReallocationExtraSize(), ptr()->tags_);
+        SizeTag::increaseSize(ReallocationForcedExtraSize(), ptr()->tags_);
     if (newTags == ptr()->tags_) {
       // If tags wasn't changed the size was already at kMaxSizeTag. This case
       // needs still to be handled. The HashCodeRetrievedBit is left set, to
       // differentiate from the other case.
-      OS::Print("Could't increase size in tag after reallocation for object %p, cid %d, size %d. Tag size is %d (should equal 0) \n",
-                ptr(), GetClassId(), HeapSize(), size);
+      //OS::Print("Could't increase size in tag after reallocation for object %p, cid %d, size %d. Tag size is %d (should equal 0) \n",
+      //          ptr(), GetClassId(), HeapSize(), size);
       newTags = HashCodeRetrievedBit::update(true, newTags);
     } else {
       newTags = HashCodeRetrievedBit::update(false, newTags);
@@ -319,7 +319,7 @@ class RawObject {
       *reinterpret_cast<RawSmi**>(new_addr + size + trailingExtraSize -
                                   kWordSize) = ValueToRawSmi(GetHash());
       RawObject* raw_new = FromAddr(new_addr);
-      raw_new->ptr()->tags_ = ReallocationTags();
+      raw_new->ptr()->tags_ = ReallocationTagsWithTrailingExtraSize();
       intptr_t hash = ValueFromRawSmi(
           *reinterpret_cast<RawSmi**>(LastPointerAddr(raw_new)));
       //if (hash != 0) {
@@ -371,7 +371,7 @@ class RawObject {
       /*raw_new->StoreSmi(
           reinterpret_cast<RawSmi**>(new_addr + trailingExtraSize - kWordSize),
           ValueToRawSmi(GetHash()));*/
-      raw_new->ptr()->tags_ = ReallocationTags();
+      raw_new->ptr()->tags_ = ReallocationTagsWithTrailingExtraSize();
       intptr_t hash = ValueFromRawSmi(
           *reinterpret_cast<RawSmi**>(LastPointerAddr(raw_new)));
       if (hash != 0) {
