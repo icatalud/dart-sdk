@@ -274,11 +274,18 @@ class RawObject {
     //         1)
     //        << kObjectAlignmentLog2;
     if (HashCodeWasRetrieved() && !HasTrailingHashCode()) {
-      return 0;  // TODO: testing extra size 0
-      // return kObjectAlignment;
+      return kObjectAlignment;
     }
     if (!HasTrailingHashCode()) {  // TODO: testing always add trailing hashCode
-      // return kObjectAlignment;
+      return kObjectAlignment;
+    }
+    return 0;
+  }
+
+  uint8_t ReallocationForcedExtraSize() const {
+    ASSERT(IsHeapObject());
+    if (!HasTrailingHashCode()) {
+      return kObjectAlignment;
     }
     return 0;
   }
@@ -291,30 +298,54 @@ class RawObject {
       // If tags wasn't changed the size was already at kMaxSizeTag. This case
       // needs still to be handled. The HashCodeRetrievedBit is left set, to
       // differentiate from the other case.
-      newTags = TrailingHashCodeBit::update(true, newTags);
-      OS::Print("Could't increase size in tag after reallocation. %d==0? \n",
-                size);
+      OS::Print("Could't increase size in tag after reallocation for object %p, cid %d, size %d. Tag size is %d (should equal 0) \n",
+                ptr(), GetClassId(), HeapSize(), size);
+      newTags = HashCodeRetrievedBit::update(true, newTags);
     } else {
       newTags = HashCodeRetrievedBit::update(false, newTags);
-      newTags = TrailingHashCodeBit::update(true, newTags);
     }
+    newTags = TrailingHashCodeBit::update(true, newTags);
     return newTags;
+  }
+
+  void ReallocateWithTrailingHash(uword new_addr, size_t size) {
+    ASSERT(IsHeapObject());
+    ASSERT(size == HeapSize());
+    memmove(reinterpret_cast<void*>(new_addr), reinterpret_cast<void*>(ptr()),
+            size);
+    uint8_t trailingExtraSize = ReallocationForcedExtraSize();
+    if (trailingExtraSize > 0) {
+      memset(reinterpret_cast<void*>(new_addr + size), NULL, trailingExtraSize);
+      *reinterpret_cast<RawSmi**>(new_addr + size + trailingExtraSize -
+                                  kWordSize) = ValueToRawSmi(GetHash());
+      RawObject* raw_new = FromAddr(new_addr);
+      raw_new->ptr()->tags_ = ReallocationTags();
+      intptr_t hash = ValueFromRawSmi(
+          *reinterpret_cast<RawSmi**>(LastPointerAddr(raw_new)));
+      //if (hash != 0) {
+      //  OS::Print(
+      //      "FORCED: Moved object from %p to %p with class id %d and hash: 0x%X "
+      //      "storing "
+      //      "trailing hash: 0x%X\n",
+      //      ptr(), new_addr, GetClassId(), GetHash(), hash);
+      //}
+    }
   }
 #endif
 
   intptr_t ReallocationHeapSize() const {
-#if !defined(FAST_HASH_FOR_32_BIT)
-    return HeapSize();
-#else
+#if defined(FAST_HASH_FOR_32_BIT)
     return HeapSize() + ReallocationExtraSize();
+#else
+    return HeapSize();
 #endif
   }
 
-  static RawSmi* NewSmi(intptr_t value) {
-    RawSmi* raw_smi = reinterpret_cast<RawSmi*>(
-        (static_cast<uintptr_t>(value) << kSmiTagShift) | kSmiTag);
-    ASSERT(ValueFromRawSmi(raw_smi) == value);
-    return raw_smi;
+  void MoveTo(uword new_addr, size_t size) {
+    ASSERT(IsHeapObject());
+    ASSERT(size == HeapSize());
+    memmove(reinterpret_cast<void*>(new_addr), reinterpret_cast<void*>(ptr()),
+            size);
   }
 
   void Reallocate(uword new_addr, size_t size) {
@@ -326,16 +357,43 @@ class RawObject {
 #if defined(FAST_HASH_FOR_32_BIT)  // 32 bit platform
     uint8_t trailingExtraSize = ReallocationExtraSize();
     if (trailingExtraSize > 0) {
-      // OS::Print("Moved object %s storing trailing hashcode: 0x%X\n",  ,GetHash());
+      /*OS::Print("Moved object %d storing trailing hashcode: 0x%X\n",
+                GetClassId(), GetHash());*/
       // Stores the hashCode in the last spot of the object. It is assumed that
       // this extra space was taken into account before invoking Reallocate.
       /*StoreSmi(reinterpret_cast<rawsmi*>(new_addr + size),
                NewSmi(reinterpret_cast<uintptr_t>(this)));*/
-      memset(reinterpret_cast<void*>(new_addr + size), NULL, kWordSize);
-      *reinterpret_cast<RawSmi**>(new_addr + trailingExtraSize - kWordSize) =
-          NewSmi(GetHash());
-      // RawObject* raw_new = reinterpret_cast<RawObject*>(new_addr);
-      RawObject::FromAddr(new_addr)->ptr()->tags_ = ReallocationTags();
+      memset(reinterpret_cast<void*>(new_addr + size), NULL, trailingExtraSize);
+      *reinterpret_cast<RawSmi**>(new_addr + size + trailingExtraSize -
+                                  kWordSize) = ValueToRawSmi(GetHash());
+      //RawObject::FromAddr(new_addr)->ptr()->tags_ = ReallocationTags();
+      RawObject* raw_new = FromAddr(new_addr);
+      /*raw_new->StoreSmi(
+          reinterpret_cast<RawSmi**>(new_addr + trailingExtraSize - kWordSize),
+          ValueToRawSmi(GetHash()));*/
+      raw_new->ptr()->tags_ = ReallocationTags();
+      intptr_t hash = ValueFromRawSmi(
+          *reinterpret_cast<RawSmi**>(LastPointerAddr(raw_new)));
+      if (hash != 0) {
+        OS::Print(
+            "Moved object from %p to %p with class id %d and hash: 0x%X "
+            "storing "
+            "trailing hash: 0x%X\n",
+            ptr(), new_addr, GetClassId(), GetHash(), hash);
+      }
+      /*OS::Print("old size: %d, new size: %d, new reallocationHeapSize: %d\n",
+                HeapSize(), raw_new->HeapSize(), raw_new->ReallocationHeapSize());*/
+
+      /*uword lastManual = new_addr + size + trailingExtraSize - kWordSize;
+      uword last = LastPointerAddr(raw_new);
+      if (lastManual == last) {
+        OS::Print("Good same last address with value: 0x%X, value before last: 0x%X\n",
+                  *reinterpret_cast<uintptr_t*>(last),
+                  *reinterpret_cast<uword*>(last-kWordSize));
+      }
+      else {
+        OS::Print("Bad, address mismatch: 0x%X, 0x%X, diff: %d, object pointer: 0x%X\n", lastManual, last, lastManual-last, new_addr);
+      }*/
     }
 #endif
   }
@@ -598,8 +656,8 @@ class RawObject {
   }
 
   static uword LastPointerAddr(const RawObject* raw_obj) {
-    return reinterpret_cast<uword>(raw_obj->ptr()) + raw_obj->HeapSize() -
-           kWordSize;
+    return (reinterpret_cast<uword>(raw_obj->ptr()) + raw_obj->HeapSize() -
+            kWordSize);
   }
 
   static bool IsCanonical(intptr_t value) {
