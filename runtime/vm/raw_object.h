@@ -215,8 +215,21 @@ class RawObject {
   // uint32_t GetHash() const { return ptr()->hash_; }  // TODO: testing below
   uint32_t GetHash() const {
     uintptr_t value = (reinterpret_cast<uintptr_t>(this) << 1) >> 1;
-    if (ptr()->hash_ == 0) {
-      //ptr()->hash_ = value;
+    if (HasTrailingHashCode()) {
+      uint32_t hash = GetTrailingHash();
+      OS::Print(
+          "Retrieving hash from Reallocated object. hash_: %X, Trailing hash: "
+          "%X\n",
+          ptr()->hash_, hash);
+      return ptr()->hash_;
+    }
+    intptr_t cid = GetClassId();
+    if (ptr()->hash_ == 0 && (cid == kStringCid)) {  //|| cid == kClassCid
+      OS::Print("Unexpected: accessed empty GetHash for string or class\n");
+      //return ptr()->hash_;
+    }
+    if (ptr()->hash_ == 0 && cid > 75) {
+      ptr()->hash_ = value;
       // OS::Print("Accessed hashcode: 0x%X, hash_ = 0x%X\n", value, ptr()->hash_);
     }
     if (!HashCodeWasRetrieved()) {  // TODO: testing
@@ -226,21 +239,21 @@ class RawObject {
     // return rand();  //ptr()->hash_;
   }
 #else
-  uint32_t GetHash() {
-    intptr_t value;
+  uint32_t GetHash() const {
     if (HasTrailingHashCode()) {
-      value = static_cast<intptr_t>(LastPointerAddr(this));
-    } else {
-      value = reinterpret_cast<intptr_t>(this);
+      //OS::Print("Trailing hash retrieved for cid %d\n", GetClassId());
+      return GetTrailingHash();
     }
-    // Shift to convert to *RawSmi (loses most significant bit)
-    value <<= 1;
-    if (!HashCodeWasRetrieved()) {  // TODO: testing
+    uintptr_t value = (reinterpret_cast<uintptr_t>(this) << 1) >> 1;
+    // Shift to convert to RawSmi* (loses most significant bit)
+    //value <<= 1;
+    if (!HashCodeWasRetrieved()) {
       ptr()->tags_.fetch_or(HashCodeRetrievedBit::encode(true));
+      //OS::Print("Set hashcode retrieved bit to %u for cid %d\n", HashCodeWasRetrieved(), GetClassId());
     }
     // return static_cast<uint32_t>(static_cast<intptr_t>(this));
     // value = reinterpret_cast<intptr_t>(this) << 1;
-    return static_cast<uint32_t>(value >> 1);
+    return static_cast<uint32_t>(value);
   }
 #endif
 
@@ -288,6 +301,11 @@ class RawObject {
       return kObjectAlignment;
     }
     return 0;
+  }
+
+  uint32_t GetTrailingHash() const {
+    ASSERT(HasTrailingHashCode());
+    return static_cast<uint32_t>(ValueFromRawSmi(*reinterpret_cast<RawSmi**>(LastPointerAddr(this))));
   }
 
   uint32_t ReallocationTagsWithTrailingExtraSize() {
